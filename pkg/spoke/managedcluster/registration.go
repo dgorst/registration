@@ -25,6 +25,8 @@ import (
 // NewClientCertForHubController returns a controller to
 // 1). Create a new client certificate and build a hub kubeconfig for the registration agent;
 // 2). Or rotate the client certificate referenced by the hub kubeconfig before it become expired;
+// TODO(@dgorst) This is now the CSR registration controller.
+// TODO(@dgorst) Create an alternative for AWS IAM
 func NewClientCertForHubController(
 	clusterName string,
 	agentName string,

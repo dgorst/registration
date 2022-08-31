@@ -2,6 +2,7 @@ package spoke
 
 import (
 	"github.com/spf13/cobra"
+	"os"
 
 	"github.com/openshift/library-go/pkg/controller/controllercmd"
 
@@ -22,5 +23,7 @@ func NewAgent() *cobra.Command {
 	agentOptions.AddFlags(flags)
 
 	flags.BoolVar(&cmdConfig.DisableLeaderElection, "disable-leader-election", false, "Disable leader election for the agent.")
+	flags.StringVar(&agentOptions.AwsIamWorkerRole, "aws-worker-iam-role", os.Getenv("AWS_ROLE_ARN"), "AWS Only: The IAM role the registration agent will assume") // TODO Don't need this AWS_ROLE_ARN
+
 	return cmd
 }

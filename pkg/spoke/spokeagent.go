@@ -63,6 +63,7 @@ type SpokeAgentOptions struct {
 	ClusterHealthCheckPeriod time.Duration
 	MaxCustomClusterClaims   int
 	SpokeKubeconfig          string
+	AwsIamWorkerRole         string
 }
 
 // NewSpokeAgentOptions returns a SpokeAgentOptions
@@ -161,11 +162,25 @@ func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext
 	}
 
 	// start a SpokeClusterCreatingController to make sure there is a spoke cluster on hub cluster
+
+	// TODO(@dgorst) tidy this up
+	useCsrRegistration := true
+	useAwsIamRegistration := false
+	var managedClusterAnnotations map[string]string
+	if o.AwsIamWorkerRole != "" {
+		useCsrRegistration = false
+		useAwsIamRegistration = true
+		managedClusterAnnotations = map[string]string{
+			"open-cluster-management.io/aws-iam-worker-role": o.AwsIamWorkerRole,
+		}
+	}
+
 	spokeClusterCreatingController := managedcluster.NewManagedClusterCreatingController(
 		o.ClusterName, o.SpokeExternalServerURLs,
 		spokeClusterCABundle,
 		bootstrapClusterClient,
 		controllerContext.EventRecorder,
+		managedClusterAnnotations,
 	)
 	go spokeClusterCreatingController.Run(ctx, 1)
 
@@ -189,7 +204,9 @@ func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext
 	// exists a valid client config for hub or not, the controller will be started and then stopped immediately
 	// in scenario #2 and #3, which results in an error message in log: 'Observed a panic: timeout waiting for
 	// informer cache'
+	// TODO(@dgorst) - Fork IAM vs CSR here?
 	if !ok {
+
 		// create a ClientCertForHubController for spoke agent bootstrap
 		bootstrapInformerFactory := informers.NewSharedInformerFactory(bootstrapKubeClient, 10*time.Minute)
 
@@ -201,20 +218,54 @@ func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext
 		}
 
 		controllerName := fmt.Sprintf("BootstrapClientCertController@cluster:%s", o.ClusterName)
-		clientCertForHubController, err := managedcluster.NewClientCertForHubController(
-			o.ClusterName, o.AgentName, o.ComponentNamespace, o.HubKubeconfigSecret,
-			kubeconfigData,
-			// store the secret in the cluster where the agent pod runs
-			namespacedManagementKubeInformerFactory.Core().V1().Secrets(),
-			bootstrapInformerFactory.Certificates(),
-			managementKubeClient,
-			bootstrapKubeClient,
-			managedcluster.GenerateBootstrapStatusUpdater(),
-			controllerContext.EventRecorder,
-			controllerName,
-		)
-		if err != nil {
-			return err
+
+		// TODO(@dgorst) - we could swap this out with an IAM controller here? (validate we can assume the hub role?)
+		var clientConfigForHubController factory.Controller
+		if useCsrRegistration {
+			clientConfigForHubController, err = managedcluster.NewClientCertForHubController(
+				o.ClusterName, o.AgentName, o.ComponentNamespace, o.HubKubeconfigSecret,
+				kubeconfigData,
+				// store the secret in the cluster where the agent pod runs
+				namespacedManagementKubeInformerFactory.Core().V1().Secrets(),
+				bootstrapInformerFactory.Certificates(),
+				managementKubeClient,
+				bootstrapKubeClient,
+				managedcluster.GenerateBootstrapStatusUpdater(),
+				controllerContext.EventRecorder,
+				controllerName,
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		if useAwsIamRegistration {
+
+			// create a cluster informer factory with name field selector because we just need to handle the current spoke cluster
+			fmt.Println("WATCHING", o.ClusterName)
+			hubBootstrapClusterInformerFactory := clusterv1informers.NewSharedInformerFactoryWithOptions(
+				bootstrapClusterClient,
+				10*time.Minute,
+				clusterv1informers.WithTweakListOptions(func(listOptions *metav1.ListOptions) {
+					listOptions.FieldSelector = fields.OneTermEqualSelector("metadata.name", o.ClusterName).String()
+				}),
+			)
+
+			// create a clientConfigForHubController which just tries to assume the hub role
+			clientConfigForHubController, err = managedcluster.NewClientForIamController(
+				o.ClusterName,
+				o.AgentName,
+				o.ComponentNamespace,
+				o.HubKubeconfigSecret,
+				namespacedManagementKubeInformerFactory.Core().V1().Secrets(),
+				hubBootstrapClusterInformerFactory.Cluster().V1().ManagedClusters(),
+				managementKubeClient, managedcluster.GenerateBootstrapStatusUpdater(),
+				controllerContext.EventRecorder,
+				controllerName,
+				bootstrapClusterClient)
+			if err != nil {
+				return err
+			}
 		}
 
 		bootstrapCtx, stopBootstrap := context.WithCancel(ctx)
@@ -222,7 +273,7 @@ func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext
 		go bootstrapInformerFactory.Start(bootstrapCtx.Done())
 		go namespacedManagementKubeInformerFactory.Start(bootstrapCtx.Done())
 
-		go clientCertForHubController.Run(bootstrapCtx, 1)
+		go clientConfigForHubController.Run(bootstrapCtx, 1)
 
 		// wait for the hub client config is ready.
 		klog.Info("Waiting for hub client config and managed cluster to be ready")
@@ -232,9 +283,10 @@ func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext
 			return err
 		}
 
-		// stop the clientCertForHubController for bootstrap once the hub client config is ready
+		// stop the clientConfigForHubController for bootstrap once the hub client config is ready
 		stopBootstrap()
 	}
+	// TODO(@dgorst) - assuming execution will only arrive here once we have a hub token
 
 	// create hub clients and shared informer factories from hub kube config
 	hubClientConfig, err := clientcmd.BuildConfigFromFlags("", path.Join(o.HubKubeconfigDir, clientcert.KubeconfigFile))
@@ -286,19 +338,43 @@ func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext
 
 	// create another ClientCertForHubController for client certificate rotation
 	controllerName := fmt.Sprintf("ClientCertController@cluster:%s", o.ClusterName)
-	clientCertForHubController, err := managedcluster.NewClientCertForHubController(
-		o.ClusterName, o.AgentName, o.ComponentNamespace, o.HubKubeconfigSecret,
-		kubeconfigData,
-		namespacedManagementKubeInformerFactory.Core().V1().Secrets(),
-		hubKubeInformerFactory.Certificates(),
-		managementKubeClient,
-		hubKubeClient,
-		managedcluster.GenerateStatusUpdater(hubClusterClient, o.ClusterName),
-		controllerContext.EventRecorder,
-		controllerName,
-	)
-	if err != nil {
-		return err
+
+	// TODO (@dgorst)
+	var clientConfigForHubController factory.Controller
+
+	if useCsrRegistration {
+		clientConfigForHubController, err = managedcluster.NewClientCertForHubController(
+			o.ClusterName, o.AgentName, o.ComponentNamespace, o.HubKubeconfigSecret,
+			kubeconfigData,
+			namespacedManagementKubeInformerFactory.Core().V1().Secrets(),
+			hubKubeInformerFactory.Certificates(),
+			managementKubeClient,
+			hubKubeClient,
+			managedcluster.GenerateStatusUpdater(hubClusterClient, o.ClusterName),
+			controllerContext.EventRecorder,
+			controllerName,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	if useAwsIamRegistration {
+		// create a clientConfigForHubController which just tries to assume the hub role
+		clientConfigForHubController, err = managedcluster.NewClientForIamController(
+			o.ClusterName,
+			o.AgentName,
+			o.ComponentNamespace,
+			o.HubKubeconfigSecret,
+			namespacedManagementKubeInformerFactory.Core().V1().Secrets(),
+			hubClusterInformerFactory.Cluster().V1().ManagedClusters(),
+			managementKubeClient, managedcluster.GenerateBootstrapStatusUpdater(),
+			controllerContext.EventRecorder,
+			controllerName,
+			nil) // TODO use actual client, not the bootstrap one
+		if err != nil {
+			return err
+		}
 	}
 
 	// create ManagedClusterJoiningController to reconcile instances of ManagedCluster on the managed cluster
@@ -381,7 +457,7 @@ func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext
 	go spokeClusterInformerFactory.Start(ctx.Done())
 	go addOnInformerFactory.Start(ctx.Done())
 
-	go clientCertForHubController.Run(ctx, 1)
+	go clientConfigForHubController.Run(ctx, 1)
 	go managedClusterJoiningController.Run(ctx, 1)
 	go managedClusterLeaseController.Run(ctx, 1)
 	go managedClusterHealthCheckController.Run(ctx, 1)

@@ -27,23 +27,27 @@ var (
 
 // managedClusterCreatingController creates a ManagedCluster on hub cluster during the spoke agent bootstrap phase
 type managedClusterCreatingController struct {
-	clusterName             string
-	spokeExternalServerURLs []string
-	spokeCABundle           []byte
-	hubClusterClient        clientset.Interface
+	clusterName               string
+	spokeExternalServerURLs   []string
+	spokeCABundle             []byte
+	hubClusterClient          clientset.Interface
+	managedClusterAnnotations map[string]string
 }
 
 // NewManagedClusterCreatingController creates a new managedClusterCreatingController on the managed cluster.
+// TODO(@dgorst) accept optional annotations that would contain AWS config
 func NewManagedClusterCreatingController(
 	clusterName string, spokeExternalServerURLs []string,
 	spokeCABundle []byte,
 	hubClusterClient clientset.Interface,
-	recorder events.Recorder) factory.Controller {
+	recorder events.Recorder,
+	managedClusterAnnotations map[string]string) factory.Controller {
 	c := &managedClusterCreatingController{
-		clusterName:             clusterName,
-		spokeExternalServerURLs: spokeExternalServerURLs,
-		spokeCABundle:           spokeCABundle,
-		hubClusterClient:        hubClusterClient,
+		clusterName:               clusterName,
+		spokeExternalServerURLs:   spokeExternalServerURLs,
+		spokeCABundle:             spokeCABundle,
+		hubClusterClient:          hubClusterClient,
+		managedClusterAnnotations: managedClusterAnnotations,
 	}
 
 	return factory.New().
@@ -68,7 +72,8 @@ func (c *managedClusterCreatingController) sync(ctx context.Context, syncCtx fac
 
 	managedCluster := &clusterv1.ManagedCluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: c.clusterName,
+			Name:        c.clusterName,
+			Annotations: c.managedClusterAnnotations,
 		},
 	}
 
