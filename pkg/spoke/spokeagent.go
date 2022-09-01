@@ -105,6 +105,7 @@ func NewSpokeAgentOptions() *SpokeAgentOptions {
 // and started if the hub kubeconfig does not exist or is invalid and used to
 // create a valid hub kubeconfig. Once the hub kubeconfig is valid, the
 // temporary controller is stopped and the main controllers are started.
+// TODO lots of IAM shit needs changing here
 func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext *controllercmd.ControllerContext) error {
 	// create management kube client
 	managementKubeClient, err := kubernetes.NewForConfig(controllerContext.KubeConfig)
@@ -257,12 +258,15 @@ func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext
 				o.AgentName,
 				o.ComponentNamespace,
 				o.HubKubeconfigSecret,
+				o.HubKubeconfigDir,
 				namespacedManagementKubeInformerFactory.Core().V1().Secrets(),
 				hubBootstrapClusterInformerFactory.Cluster().V1().ManagedClusters(),
-				managementKubeClient, managedcluster.GenerateBootstrapStatusUpdater(),
+				managementKubeClient,
+				managedcluster.GenerateBootstrapStatusUpdater(),
 				controllerContext.EventRecorder,
 				controllerName,
-				bootstrapClusterClient)
+				bootstrapClusterClient,
+			)
 			if err != nil {
 				return err
 			}
@@ -360,18 +364,27 @@ func (o *SpokeAgentOptions) RunSpokeAgent(ctx context.Context, controllerContext
 	}
 
 	if useAwsIamRegistration {
+
+		clusterClient, err := clusterv1client.NewForConfig(hubClientConfig)
+		if err != nil {
+			return err
+		}
+
 		// create a clientConfigForHubController which just tries to assume the hub role
 		clientConfigForHubController, err = managedcluster.NewClientForIamController(
 			o.ClusterName,
 			o.AgentName,
 			o.ComponentNamespace,
 			o.HubKubeconfigSecret,
+			o.HubKubeconfigDir,
 			namespacedManagementKubeInformerFactory.Core().V1().Secrets(),
 			hubClusterInformerFactory.Cluster().V1().ManagedClusters(),
-			managementKubeClient, managedcluster.GenerateBootstrapStatusUpdater(),
+			managementKubeClient,
+			managedcluster.GenerateBootstrapStatusUpdater(),
 			controllerContext.EventRecorder,
 			controllerName,
-			nil) // TODO use actual client, not the bootstrap one
+			clusterClient, // this signifies we are now refreshing and not bootstrapping
+		)
 		if err != nil {
 			return err
 		}
@@ -567,10 +580,16 @@ func generateAgentName() string {
 // completes. Changing the name of the cluster will make the existing hub kubeconfig invalid,
 // because certificate in TLSCertFile is issued to a specific cluster/agent.
 func (o *SpokeAgentOptions) hasValidHubClientConfig() (bool, error) {
+
 	kubeconfigPath := path.Join(o.HubKubeconfigDir, clientcert.KubeconfigFile)
 	if _, err := os.Stat(kubeconfigPath); os.IsNotExist(err) {
 		klog.V(4).Infof("Kubeconfig file %q not found", kubeconfigPath)
 		return false, nil
+	}
+
+	// Only a kubeconfig file if AWS IAM
+	if o.AwsIamWorkerRole != "" {
+		return true, nil
 	}
 
 	keyPath := path.Join(o.HubKubeconfigDir, clientcert.TLSKeyFile)

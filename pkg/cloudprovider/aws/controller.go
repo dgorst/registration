@@ -12,60 +12,85 @@ import (
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/klog/v2"
 	clientset "open-cluster-management.io/api/client/cluster/clientset/versioned"
+	clustersv1 "open-cluster-management.io/api/client/cluster/clientset/versioned/typed/cluster/v1"
 	v1 "open-cluster-management.io/api/client/cluster/informers/externalversions/cluster/v1"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	"open-cluster-management.io/registration/pkg/clientcert"
+	"path"
 	"reflect"
 	"time"
 )
 
-var ControllerResyncInterval = 5 * time.Minute
+var (
+	ControllerResyncInterval = 60 * time.Minute // TODO(@dgorst) - should be under IAM credential duration
+)
+
+const (
+	kubeconfigFile = "kubeconfig"
+)
 
 type controller struct {
-	clusterName               string
-	agentName                 string
-	clientCertSecretNamespace string
-	clientCertSecretName      string
-	spokeSecretInformer       corev1informers.SecretInformer
-	managedClusterInformer    v1.ManagedClusterInformer
-	spokeKubeClient           kubernetes.Interface
-	statusUpdater             clientcert.StatusUpdateFunc
-	recorder                  events.Recorder
-	controllerName            string
-	bootstrapClusterClient    *clientset.Clientset
+	clusterName            string
+	agentName              string
+	hubKubeconfigSecretNs  string
+	hubKubeconfigSecret    string
+	hubKubeconfigDir       string
+	spokeSecretInformer    corev1informers.SecretInformer
+	managedClusterInformer v1.ManagedClusterInformer
+	spokeKubeClient        kubernetes.Interface
+	statusUpdater          clientcert.StatusUpdateFunc
+	recorder               events.Recorder
+	controllerName         string
+	hubClusterClient       *clientset.Clientset
 }
 
-func (c *controller) sync(ctx context.Context, syncCtx factory.SyncContext) error {
-	fmt.Println("SYNCING AWS IAM CREDENTIALS for", c.clusterName)
+func (c *controller) sync(ctx context.Context, _ factory.SyncContext) error {
+	for {
+		select {
+		case <-time.After(15 * time.Second): // retry for errors
+			if err := c.joinAndGenerateKubeconfig(ctx, c.hubClusterClient.ClusterV1().ManagedClusters()); err != nil {
+				klog.Warningf("error accessing hub - will retry: %s", err)
+			} else {
+				c.recorder.Eventf("IAMCredentialsCreated", "IAM credentials were created", c.clusterName)
+				return nil // now we are into the main resync period
+			}
+		case <-ctx.Done():
+			klog.Infof("bootstrap completed")
+			return nil
+		}
+	}
+}
 
-	cluster, err := c.bootstrapClusterClient.ClusterV1().ManagedClusters().Get(ctx, c.clusterName, metav1.GetOptions{})
+func (c *controller) joinAndGenerateKubeconfig(ctx context.Context, mci clustersv1.ManagedClusterInterface) error {
+	klog.Infof("Reading managedcluster %s to obtain hub information", c.clusterName)
+
+	// TODO(@dgorst) - we should save this data locally then we can always recover
+	// Without that, if use loose access to the hub we can never generate new credentials - persist as configmap?
+
+	cluster, err := mci.Get(ctx, c.clusterName, metav1.GetOptions{})
 	if err != nil {
-		fmt.Println("Err", err)
 		return err
 	}
 
-	fmt.Println("Got cluster", cluster.Name)
-
 	hubRoleArn, ok := cluster.Annotations["open-cluster-management.io/aws-iam-hub-role"]
 	if !ok {
-		fmt.Println("hubRoleArn not found yet")
-		return nil
+		return fmt.Errorf("aws-iam-hub-role annotation not present")
 	}
 
 	hubEksClusterName, ok := cluster.Annotations["open-cluster-management.io/aws-iam-hub-eks-cluster"]
 	if !ok {
-		fmt.Println("hubEksClusterName not found yet")
-		return nil
+		return fmt.Errorf("aws-iam-hub-eks-cluster annotation not present")
 	}
 
 	hubRegion, ok := cluster.Annotations["open-cluster-management.io/aws-iam-hub-region"]
 	if !ok {
-		fmt.Println("hubRegion not found yet")
-		return nil
+		return fmt.Errorf("aws-iam-hub-region annotation not present")
 	}
 
-	fmt.Println("building kubeconfig")
+	klog.Infof("managedcluster %s : hubRegion=%s hubEksClusterName=%s hubRoleArn=%s", c.clusterName, hubRegion, hubEksClusterName, hubRoleArn)
 	client, err := NewFromDefaultConfig(Opts{
 		HubRoleArn:        hubRoleArn,
 		HubEksClusterName: hubEksClusterName,
@@ -75,7 +100,7 @@ func (c *controller) sync(ctx context.Context, syncCtx factory.SyncContext) erro
 		return err
 	}
 
-	fmt.Println("building kubeconfig")
+	klog.Infof("creating kubeconfig for hub cluster...")
 	config, err := client.BuildHubClient(ctx, c.clusterName)
 	if err != nil {
 		return err
@@ -85,29 +110,36 @@ func (c *controller) sync(ctx context.Context, syncCtx factory.SyncContext) erro
 	if err != nil {
 		return err
 	}
-	mc, err := kc.ClusterV1().ManagedClusters().Get(ctx, c.clusterName, metav1.GetOptions{})
+
+	klog.Infof("testing access to hub cluster...")
+	_, err = kc.ClusterV1().ManagedClusters().Get(ctx, c.clusterName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
-	fmt.Println("SUCCESS - Got managed cluster using IAM credentials", mc.Name)
+	klog.Infof("testing access to hub cluster - SUCCESS")
 
-	c.recorder.Eventf("IAMCredentialsCreated", "IAM credentials were created", cluster.Name)
-
+	cfg := CreateKubeconfig(config)
+	kubeconfigPath := path.Join(c.hubKubeconfigDir, kubeconfigFile)
+	klog.Infof("writing kubeconfig to %s", kubeconfigPath)
+	if err := clientcmd.WriteToFile(cfg, kubeconfigPath); err != nil {
+		return err
+	}
 	return nil
 }
 
 func NewClientCertificateController(
 	clusterName string,
 	agentName string,
-	clientCertSecretNamespace string,
-	clientCertSecretName string,
+	hubKubeconfigSecretNs string,
+	hubKubeconfigSecret string,
+	hubKubeconfigDir string,
 	spokeSecretInformer corev1informers.SecretInformer,
 	managedClusterInformer v1.ManagedClusterInformer,
 	spokeKubeClient kubernetes.Interface,
 	statusUpdater clientcert.StatusUpdateFunc,
 	recorder events.Recorder,
 	controllerName string,
-	bootstrapClusterClient *clientset.Clientset,
+	hubClusterClient *clientset.Clientset,
 ) (factory.Controller, error) {
 
 	// Set up informer to watch the managedcluster and await the additional annotations needed to generate a kubeconfig
@@ -132,17 +164,18 @@ func NewClientCertificateController(
 	})
 
 	c := controller{
-		clusterName:               clusterName,
-		agentName:                 agentName,
-		clientCertSecretNamespace: clientCertSecretNamespace,
-		clientCertSecretName:      clientCertSecretName,
-		spokeSecretInformer:       spokeSecretInformer,
-		managedClusterInformer:    managedClusterInformer,
-		spokeKubeClient:           spokeKubeClient,
-		statusUpdater:             statusUpdater,
-		recorder:                  recorder,
-		controllerName:            controllerName,
-		bootstrapClusterClient:    bootstrapClusterClient,
+		clusterName:            clusterName,
+		agentName:              agentName,
+		hubKubeconfigSecretNs:  hubKubeconfigSecretNs,
+		hubKubeconfigSecret:    hubKubeconfigSecret,
+		hubKubeconfigDir:       hubKubeconfigDir,
+		spokeSecretInformer:    spokeSecretInformer,
+		managedClusterInformer: managedClusterInformer,
+		spokeKubeClient:        spokeKubeClient,
+		statusUpdater:          statusUpdater,
+		recorder:               recorder,
+		controllerName:         controllerName,
+		hubClusterClient:       hubClusterClient,
 	}
 
 	return factory.New().
@@ -153,7 +186,7 @@ func NewClientCertificateController(
 			if err != nil {
 				return false
 			}
-			if accessor.GetNamespace() == c.clientCertSecretNamespace && accessor.GetName() == c.clientCertSecretName {
+			if accessor.GetNamespace() == c.hubKubeconfigSecretNs && accessor.GetName() == c.hubKubeconfigSecret {
 				return true
 			}
 			return false
