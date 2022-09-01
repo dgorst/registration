@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/events"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -124,6 +126,48 @@ func (c *controller) joinAndGenerateKubeconfig(ctx context.Context, mci clusters
 	if err := clientcmd.WriteToFile(cfg, kubeconfigPath); err != nil {
 		return err
 	}
+
+	kubeconfigByt, err := clientcmd.Write(cfg)
+	if err != nil {
+		return err
+	}
+
+	secret, err := c.spokeKubeClient.CoreV1().Secrets(c.hubKubeconfigSecretNs).Get(ctx, c.hubKubeconfigSecret, metav1.GetOptions{})
+	if err != nil && errors.IsNotFound(err) {
+		// FIRST TIME - create
+		secret = &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: c.hubKubeconfigSecretNs,
+				Name:      c.hubKubeconfigSecret,
+				Annotations: map[string]string{
+					"open-cluster-management.io/aws-iam-hub-role":        hubRoleArn,
+					"open-cluster-management.io/aws-iam-hub-eks-cluster": hubEksClusterName,
+					"open-cluster-management.io/aws-iam-hub-region":      hubRegion,
+				},
+			},
+			Data: map[string][]byte{
+				kubeconfigFile: kubeconfigByt,
+			},
+		}
+		secret, err = c.spokeKubeClient.CoreV1().Secrets(c.hubKubeconfigSecretNs).Create(ctx, secret, metav1.CreateOptions{})
+		if err != nil {
+			return err
+		}
+		klog.Infof("created secret %s/%s", secret.Namespace, secret.Name)
+
+	} else if err != nil {
+		return err
+	} else {
+		// Update existing
+		secret.Data[kubeconfigFile] = kubeconfigByt
+		secret, err = c.spokeKubeClient.CoreV1().Secrets(c.hubKubeconfigSecretNs).Update(ctx, secret, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+		klog.Infof("updated secret %s/%s", secret.Namespace, secret.Name)
+
+	}
+
 	return nil
 }
 
@@ -160,6 +204,15 @@ func NewClientCertificateController(
 			if reflect.DeepEqual(oldCluster.Labels, newCluster.Labels) {
 				return
 			}
+		},
+	})
+
+	spokeSecretInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			// TODO(@dgorst) - need to do anything?
+		},
+		DeleteFunc: func(obj interface{}) {
+			// TODO(@dgorst) Handle deletion of hub kubeconfig?
 		},
 	})
 
